@@ -1,0 +1,259 @@
+# Plantilla de cloudformation,este crea lo que Terraform necesita antes de poder ejecutarse. Terraform no puede crear el bucket donde guarda su propio state, ni los permisos con los que se ejecuta, así que estos recursos se crean aparte. Se despliega una sola vez y no se destruye
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Infraestructura Cloud AWS - bootstrap. Recursos que Terraform necesita antes de
+  existir: bucket del state remoto, acceso de GitHub Actions por OIDC (sin claves)
+  y la alerta de presupuesto de la cuenta. Se despliega una sola vez y no se destruye.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "GitHub" }
+        Parameters: [GitHubOwner, GitHubRepo, GitHubEnvironment, CreateOIDCProvider]
+      - Label: { default: "Presupuesto" }
+        Parameters: [BudgetEmail, MonthlyBudgetUSD]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: infra-cloud-aws
+    AllowedPattern: "^[a-z0-9-]{3,30}$"
+    Description: Prefijo de los nombres de recursos.
+  GitHubOwner:
+    Type: String
+    Default: alexxmrtin
+    Description: Usuario de GitHub dueña del repositorio.
+  GitHubRepo:
+    Type: String
+    Default: Infraestructura-Cloud-AWS
+    Description: Nombre del repositorio en GitHub.
+  GitHubEnvironment:
+    Type: String
+    Default: dev
+    Description: Environment de GitHub (con aprobación manual) desde el que se permite apply/destroy.
+  # IAM solo permite un proveedor OIDC por URL en cada cuenta: si la cuenta ya
+  # tiene el de GitHub, intentar crear otro da error. Según exista o no, usamos
+  # "true" (lo crea este stack) o "false" (se reutiliza el existente).
+  #
+  # Para aclarar, el proveedor OIDC es un recurso de la cuenta AWS (IAM ->
+  # Identity providers), no de un usuario IAM, y no es un token. Solo declara
+  # que AWS confía en los tokens que firma token.actions.githubusercontent.com.
+  # Los tokens los genera GitHub en cada ejecución y duran minutos.
+  # Comprobar si ya existe: aws iam list-open-id-connect-providers
+  CreateOIDCProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Pon "false" si la cuenta ya tiene el proveedor OIDC token.actions.githubusercontent.com.
+  BudgetEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Correo que recibe las alertas de presupuesto.
+  MonthlyBudgetUSD:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Límite mensual en USD para la alerta.
+
+##Esto es basicamente un condicional que vamos a usar en el recurso del proveedor mas abajo, lo que hace es comparar el valor de CreateOIDCProvider con la etiqueta "true", si son iguales devuelve true, si no false.
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # BUCKET S3 para guardar estados
+  # State remoto de Terraform. El bloqueo usa un fichero .tflock en el propio
+  # bucket (use_lockfile = true), así que no hace falta tabla DynamoDB.
+  # ---------------------------------------------------------------------------
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain #Si borras el stack, o un cambio en la plantilla obliga a reemplazar el bucket, el bucket antiguo no se borra
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-tfstate-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration: #Bloquea acceso publico
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls: #Desactiva ACLs,permisos gestionados por politicas IAM
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-state-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+              NewerNoncurrentVersions: 10
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  # Politica del bucket, rechaza cualquier peticion no HTTPs
+  StateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt StateBucket.Arn
+              - !Sub "${StateBucket.Arn}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions -> AWS por OIDC: credenciales temporales, cero access keys.
+  # Permisos que permiten a github action entrar en una cuenta AWS
+  # ---------------------------------------------------------------------------
+
+  #Le dice a AWS que confie en los tokens que estan firmados por Github
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com # quien emite los tokens
+      ClientIdList: [sts.amazonaws.com] # solo acepta tokens emitidos para aws sts
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # Rol de solo lectura para terraform plan en PRs y ramas
+  PlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-plan"
+      Description: GitHub Actions - terraform plan (solo lectura)
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            # El principal que esta autenticado
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            # La accion que puede hacer (cambiar un token de github por credenciales AWS)
+            Action: sts:AssumeRoleWithWebIdentity
+            # Condiciones para que se realize la accion correctamente
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:pull_request"
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/*"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+      Policies:
+        - PolicyName: terraform-state-lock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListStateBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt StateBucket.Arn
+              - Sid: ReadState
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${StateBucket.Arn}/*"
+              # plan también bloquea el state: solo puede crear/borrar el .tflock.
+              - Sid: WriteLockFile
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${StateBucket.Arn}/*.tflock"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # Rol con permisos de despliegue. Solo lo puede asumir un job que corra en el
+  # environment de GitHub indicado (que exige aprobación manual).
+  ApplyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-apply"
+      Description: GitHub Actions - terraform apply/destroy (environment protegido)
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ---------------------------------------------------------------------------
+  # Alerta de presupuesto desde el día 1. Vive aquí (y no en Terraform) porque
+  # los entornos se destruyen cada sesión y la alerta debe seguir activa.
+  # ---------------------------------------------------------------------------
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUSD
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+
+Outputs:
+  StateBucketName:
+    Description: Valor para la variable de GitHub TF_STATE_BUCKET y para backend.hcl
+    Value: !Ref StateBucket
+  PlanRoleArn:
+    Description: Valor para la variable de GitHub AWS_PLAN_ROLE_ARN
+    Value: !GetAtt PlanRole.Arn
+  ApplyRoleArn:
+    Description: Valor para la variable de GitHub AWS_APPLY_ROLE_ARN
+    Value: !GetAtt ApplyRole.Arn
+  Region:
+    Description: Región donde vive el state
+    Value: !Ref AWS::Region

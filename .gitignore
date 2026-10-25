@@ -1,0 +1,34 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+backend.hcl
+*.auto.tfvars
+secret.tfvars
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / SO
+.idea/
+.vscode/
+.DS_Store
+.directory
+
+#Cosas personales
+Explicaciones/
+terraform/envs/dev/0-EXPLICACION.md
+docs/adr/

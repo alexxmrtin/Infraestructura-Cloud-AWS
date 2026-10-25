@@ -1,0 +1,9 @@
+# Configuración de Infracost (job "infracost" del workflow). Las rutas son desde la raíz del repo.
+version: 0.1
+
+projects:
+  - path: terraform/envs/dev
+    name: dev
+    usage_file: infracost-usage.yml
+    terraform_vars:
+      domain_name: example.com

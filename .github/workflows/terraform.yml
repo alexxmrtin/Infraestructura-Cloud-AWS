@@ -1,0 +1,275 @@
+#Workflow de CI: revisa el codigo, calcula plan y coste, y despliega dev a mano
+name: terraform
+
+#Cuando se lanza el workflow: en PR, en push a main (solo si cambian estas rutas) o a mano
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "bootstrap/**"
+      - "app/lambdas/**"
+      - "app/frontend/**"
+      - "infracost*.yml"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "bootstrap/**"
+      - "app/lambdas/**"
+      - "app/frontend/**"
+      - "infracost*.yml"
+      - ".github/workflows/terraform.yml"
+  #Boton manual en GitHub para elegir plan, apply o destroy
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Qué hacer con el entorno dev"
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+#Por defecto solo puede leer el codigo; cada job pide mas si lo necesita
+permissions:
+  contents: read
+
+# Un solo run a la vez contra el state de dev; nunca se cancela un apply a medias.
+concurrency:
+  group: terraform-dev
+  cancel-in-progress: false
+
+#Valores comunes a todos los jobs; lo que empieza por TF_VAR_ llega a Terraform como variable
+env:
+  TF_VERSION: "1.16.5"
+  AWS_REGION: eu-west-1
+  TF_DIR: terraform/envs/dev
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+  TF_VAR_notification_email: ${{ vars.NOTIFICATION_EMAIL }}
+
+#Los 4 trabajos: lint, plan, cost y apply
+jobs:
+  # Comprobaciones que no necesitan AWS: formato, validación, lint y seguridad.
+  lint:
+    name: fmt · validate · tflint · checkov · cfn-lint
+    runs-on: ubuntu-latest
+    steps:
+      #Descarga el codigo del repo
+      - uses: actions/checkout@v7
+
+      #Instala Terraform con la version fijada arriba
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      #Falla si el codigo no esta bien formateado
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff terraform
+
+      #Comprueba que el codigo es correcto sin conectar con AWS
+      - name: terraform validate
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      #Instala tflint
+      - uses: terraform-linters/setup-tflint@v6
+
+      #Busca errores tipicos, como variables sin usar
+      - name: tflint
+        working-directory: terraform
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl" --format compact
+
+      #Busca malas practicas de seguridad
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+
+      #Instala Python para cfn-lint
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      #Revisa la plantilla CloudFormation del bootstrap
+      - name: cfn-lint
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint bootstrap/bootstrap.yaml
+
+  # terraform plan con el rol de solo lectura (OIDC, sin access keys).
+  # Se salta hasta que existan las variables del repo (antes del bootstrap).
+  plan:
+    name: plan (dev)
+    needs: lint
+    if: ${{ vars.AWS_PLAN_ROLE_ARN != '' && vars.TF_STATE_BUCKET != '' && vars.DOMAIN_NAME != '' && (github.event_name != 'workflow_dispatch' || inputs.action == 'plan') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      #Descarga el codigo del repo
+      - uses: actions/checkout@v7
+
+      #Entra en AWS con el rol de solo lectura usando OIDC
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gh-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      #Instala Terraform; sin wrapper la salida se puede guardar con tee
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      #Conecta con el bucket S3 del state
+      - name: terraform init
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      #Calcula los cambios sin aplicarlos y los copia al resumen del run
+      - name: terraform plan
+        run: |
+          terraform plan -input=false -no-color -lock-timeout=2m -out=tfplan | tee plan.txt
+          {
+            echo "### terraform plan (dev)"
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Cuánto costaría el entorno encendido 24/7 y cuánto cambia con cada PR. No necesita AWS: Infracost lee el código.
+  # Se salta hasta que exista el secreto INFRACOST_API_KEY (gratis en infracost.io).
+  cost:
+    name: infracost
+    needs: lint
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    steps:
+      #Sin clave solo deja un aviso y el job sale en verde
+      - name: Sin clave de Infracost
+        if: ${{ env.INFRACOST_API_KEY == '' }}
+        run: echo "Crea el secreto INFRACOST_API_KEY para ver el coste estimado." >> "$GITHUB_STEP_SUMMARY"
+
+      #Descarga el codigo del repo
+      - uses: actions/checkout@v7
+        if: ${{ env.INFRACOST_API_KEY != '' }}
+
+      #Instala Infracost con la clave
+      - uses: infracost/actions/setup@v3
+        if: ${{ env.INFRACOST_API_KEY != '' }}
+        with:
+          api-key: ${{ env.INFRACOST_API_KEY }}
+
+      #Calcula el coste mensual y lo pone en el resumen del run
+      - name: Coste estimado
+        if: ${{ env.INFRACOST_API_KEY != '' }}
+        run: |
+          infracost breakdown --config-file infracost.yml --format json --out-file /tmp/infracost.json
+          infracost output --path /tmp/infracost.json --format github-comment --out-file /tmp/infracost.md
+          {
+            echo "### Coste estimado del entorno dev (24/7)"
+            cat /tmp/infracost.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # En un PR se compara con la rama de destino y se deja (o actualiza) un comentario con la diferencia.
+      - uses: actions/checkout@v7
+        if: ${{ env.INFRACOST_API_KEY != '' && github.event_name == 'pull_request' }}
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: base
+
+      #Calcula la diferencia de coste y la deja como comentario en el PR
+      - name: Diferencia con la rama de destino
+        if: ${{ env.INFRACOST_API_KEY != '' && github.event_name == 'pull_request' }}
+        run: |
+          cp infracost.yml infracost-usage.yml base/
+          (cd base && infracost breakdown --config-file infracost.yml --format json --out-file /tmp/infracost-base.json)
+          infracost diff --config-file infracost.yml --compare-to /tmp/infracost-base.json --format json --out-file /tmp/infracost-diff.json
+          infracost comment github --path /tmp/infracost-diff.json \
+            --repo "$GITHUB_REPOSITORY" --pull-request "${{ github.event.pull_request.number }}" \
+            --github-token "${{ github.token }}" --behavior update
+
+  # apply / destroy manual. Solo desde el environment "dev", que pide aprobación.
+  apply:
+    name: ${{ inputs.action }} (dev)
+    needs: lint
+    if: ${{ vars.AWS_APPLY_ROLE_ARN != '' && vars.TF_STATE_BUCKET != '' && vars.DOMAIN_NAME != '' && github.event_name == 'workflow_dispatch' && (inputs.action == 'apply' || inputs.action == 'destroy') }}
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      #Descarga el codigo del repo
+      - uses: actions/checkout@v7
+
+      #Entra en AWS con el rol que puede crear y borrar
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gh-${{ inputs.action }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      #Instala Terraform; sin wrapper los outputs salen limpios
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      #Conecta con el bucket S3 del state
+      - name: terraform init
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      #Crea o borra todo sin preguntar; la aprobacion ya la dio el environment dev
+      - name: terraform ${{ inputs.action }}
+        run: |
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            terraform destroy -input=false -auto-approve -lock-timeout=2m
+          else
+            terraform apply -input=false -auto-approve -lock-timeout=2m
+          fi
+
+      # La imagen de la API se construye para ARM (Graviton) y se sube al ECR que acaba de crear el apply.
+      - name: Construir y subir la imagen de la API
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          ECR_URL=$(terraform output -raw ecr_repository_url)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_URL%%/*}"
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+          docker buildx create --use
+          docker buildx build --platform linux/arm64 --push \
+            -t "$ECR_URL:latest" -t "$ECR_URL:${{ github.sha }}" \
+            "$GITHUB_WORKSPACE/app/api"
+
+      # ECS arranca las tareas con la imagen nueva y espera a que el ALB las vea sanas.
+      - name: Desplegar la API en ECS
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+          SERVICE=$(terraform output -raw ecs_service_name)
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment > /dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          echo "Tienda: $(terraform output -raw shop_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "API de partners: $(terraform output -raw partners_api_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dashboard: $(terraform output -raw dashboard_url)" >> "$GITHUB_STEP_SUMMARY"

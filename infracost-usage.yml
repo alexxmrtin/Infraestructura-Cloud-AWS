@@ -1,0 +1,45 @@
+# Uso mensual aproximado de una tienda de pruebas, para que Infracost estime también lo que se paga por uso.
+# Sin este fichero esos recursos salen a 0 USD. Las cifras son pequeñas a propósito: es un entorno de demo.
+version: 0.1
+
+resource_type_default_usage:
+  aws_lambda_function:
+    monthly_requests: 10000
+    request_duration_ms: 300
+  aws_sqs_queue:
+    monthly_requests: 10000
+  aws_sns_topic:
+    monthly_requests: 5000
+  aws_sfn_state_machine:
+    monthly_transitions: 5000
+  aws_api_gateway_rest_api:
+    monthly_requests: 5000
+  aws_dynamodb_table:
+    monthly_write_request_units: 20000
+    monthly_read_request_units: 50000
+    storage_gb: 1
+  aws_s3_bucket:
+    standard:
+      storage_gb: 1
+      monthly_tier_1_requests: 1000
+      monthly_tier_2_requests: 10000
+  aws_cloudwatch_log_group:
+    storage_gb: 1
+    monthly_data_ingested_gb: 1
+    monthly_data_scanned_gb: 1
+  aws_cloudfront_distribution:
+    monthly_data_transfer_to_internet_gb:
+      europe: 1
+    monthly_https_requests:
+      europe: 50000
+  aws_wafv2_web_acl:
+    monthly_requests: 50000
+  aws_lb:
+    new_connections: 1
+    active_connections: 10
+    processed_bytes_gb: 0.01
+    rule_evaluations: 1
+  aws_ecr_repository:
+    storage_gb: 1
+  aws_kms_key:
+    monthly_requests: 20000

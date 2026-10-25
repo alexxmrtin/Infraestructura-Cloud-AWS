@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShopFlow</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>ShopFlow</h1>
+    <div id="session">
+      <span id="user"></span>
+      <button id="login" hidden>Entrar</button>
+      <button id="logout" hidden>Salir</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Catálogo</h2>
+      <p class="hint" id="source"></p>
+      <ul id="products"></ul>
+    </section>
+
+    <section>
+      <h2>Tu carrito</h2>
+      <p class="hint" id="cart-hint">Entra para guardar tu carrito.</p>
+      <ul id="cart"></ul>
+      <button id="order" hidden>Hacer pedido</button>
+      <button id="clear" hidden>Vaciar carrito</button>
+    </section>
+
+    <section>
+      <h2>Mis pedidos</h2>
+      <p class="hint" id="orders-hint">Entra para ver tus pedidos.</p>
+      <ul id="orders"></ul>
+      <button id="refresh-orders" hidden>Actualizar</button>
+    </section>
+
+    <section>
+      <h2>¿Quién te ha atendido?</h2>
+      <p class="hint" id="info"></p>
+    </section>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

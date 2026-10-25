@@ -1,0 +1,2 @@
+# Copia a backend.hcl (está en .gitignore) y pon el bucket del output StateBucketName.
+bucket = "infra-cloud-aws-tfstate-123456789012-eu-west-1"
